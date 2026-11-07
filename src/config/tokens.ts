@@ -32,10 +32,32 @@ export const generateToken = async (
     { expiresIn: "7d" },
   );
 
-  // Store refresh token value + family in DB
+  // Store refresh token value + previous tokens (for multi-tab / in-flight concurrency grace period) + family in DB
+  const currentUser = await User.findById(user.id);
+  const now = new Date();
+  const GRACE_WINDOW_MS = 15 * 60 * 1000; // 15 minutes grace window
+
+  // Filter existing recent tokens to keep only those within the grace window (keep up to last 20)
+  const existingRecent = (currentUser?.previousRefreshTokens || [])
+    .filter(
+      (item) => item.token && now.getTime() - new Date(item.rotatedAt).getTime() < GRACE_WINDOW_MS,
+    )
+    .slice(-20);
+
+  // If currentUser had a valid token that is rotating, record it
+  if (currentUser?.refreshToken && currentUser.refreshToken !== refreshTokenValue) {
+    existingRecent.push({
+      token: currentUser.refreshToken,
+      rotatedAt: now,
+    });
+  }
+
   await User.findByIdAndUpdate(user.id, {
     refreshToken: refreshTokenValue,
+    previousRefreshToken: currentUser?.refreshToken || null,
+    previousRefreshTokens: existingRecent,
     refreshTokenFamily: family,
+    lastRotatedAt: now,
   });
 
   // In production (HTTPS) use sameSite:"none" + secure:true.

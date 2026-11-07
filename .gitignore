@@ -60,3 +60,8 @@ backups/
 # Chrome temporary test profiles
 chrome-profile*/
 scripts/chrome-profile*/
+
+# Scratch & local temp
+cookies.txt
+*.pdf
+_dev-server.log

@@ -91,15 +91,15 @@ const fetchBrandingData = async (): Promise<BrandingSeoCache> => {
   }
 
   const defaultData: BrandingSeoCache = {
-    companyName: "Amore Webstore",
-    companyTagline: "Crafted by leading air freshener manufacturers, Amor brings high-quality, refreshing scents to your space. Order yours today!",
+    companyName: "Storra",
+    companyTagline: "Welcome to Storra — your modern online store.",
     companyLogo: "",
-    companyFavicon: "/favicon.png",
-    seoTitle: "Amore Webstore",
-    seoDescription: "Crafted by leading air freshener manufacturers, Amor brings high-quality, refreshing scents to your space. Order yours today!",
+    companyFavicon: "/vite.svg",
+    seoTitle: "Storra",
+    seoDescription: "Welcome to Storra — your modern online store.",
     seoOgImage: "",
-    seoKeywords: "Air freshener,Perfumed oil,Perfumes",
-    googleVerification: "A6M6BitJ7rpbVjf_W3tVTZk3lCpTMuKKy3bExzTULl0",
+    seoKeywords: "E-commerce, Online Shopping, Storra",
+    googleVerification: "",
     metaPixelId: "",
     cachedAt: now,
   };
@@ -259,8 +259,7 @@ export const renderDynamicHtml = async (): Promise<string | null> => {
       "@context": "https://schema.org",
       "@type": "WebSite",
       name: data.companyName,
-      alternateName: ["Amore", "amorewebstore.com", data.companyName],
-      url: "https://www.amorewebstore.com",
+      alternateName: [data.companyName],
     };
     extraMetas.push(`<script type="application/ld+json">${JSON.stringify(siteSchema)}</script>`);
   }

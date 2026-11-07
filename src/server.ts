@@ -1,3 +1,4 @@
+// Storra E-Commerce Server
 import express from "express";
 import http from "http";
 import { Server } from "socket.io";
@@ -129,7 +130,13 @@ process.on('unhandledRejection', (reason) => {
 // Trust the nginx reverse proxy so that express-rate-limit can read the real
 // client IP from X-Forwarded-For without throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set("trust proxy", 1);
-app.use(express.json());
+app.use(
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(cookieParser());
 app.use(ensureCsrfCookie);
 

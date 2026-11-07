@@ -20,6 +20,7 @@ const KEYS = [
   // Contact Us page intro line — the rest of that page (address/phone/email) reuses the
   // SEO_ORG_* fields above instead of duplicating them (see staticPages.controller.ts).
   "PAGE_CONTACT_INTRO",
+  "CATEGORY_SHAPE",
 ] as const;
 type CompanyKey = (typeof KEYS)[number];
 
@@ -81,7 +82,17 @@ const DEFAULT_HERO_CONFIG = {
   },
 };
 
-const DEFAULT_THEME_CONFIG = { themeId: "studio-minimal" };
+interface StorefrontThemeConfig {
+  themeId: string;
+  customButtonBg?: string | null;
+  customButtonText?: string | null;
+}
+
+const DEFAULT_THEME_CONFIG: StorefrontThemeConfig = {
+  themeId: "studio-minimal",
+  customButtonBg: null,
+  customButtonText: null,
+};
 
 // Templates 1/2/3/5/6's "Shop / Company / Support" link grid — Template 4 is a
 // deliberately link-grid-free single centered column, so it's the one key without this.
@@ -149,6 +160,47 @@ const DEFAULT_FOOTER_CONFIG = {
   },
 };
 
+export interface PreFooterBannerItem {
+  id: string;
+  image: string;
+  link?: string;
+  title?: string;
+  isActive?: boolean;
+}
+
+export interface PreFooterConfig {
+  enabled: boolean;
+  autoplaySpeed?: number;
+  banners: PreFooterBannerItem[];
+}
+
+export const DEFAULT_PRE_FOOTER_CONFIG: PreFooterConfig = {
+  enabled: true,
+  autoplaySpeed: 5000,
+  banners: [],
+};
+
+export interface FeaturedCategorySlot {
+  id: string;
+  categoryId: string;
+  customTitle?: string;
+  customSubtitle?: string;
+  limit?: number;
+  isActive?: boolean;
+  template?: number;
+}
+
+export interface FeaturedCategoriesConfig {
+  slots: FeaturedCategorySlot[];
+}
+
+export const DEFAULT_FEATURED_CATEGORIES_CONFIG: FeaturedCategoriesConfig = {
+  slots: [
+    { id: "slot-1", categoryId: "", customTitle: "", customSubtitle: "", limit: 8, isActive: true, template: 1 },
+    { id: "slot-2", categoryId: "", customTitle: "", customSubtitle: "", limit: 8, isActive: true, template: 1 },
+  ],
+};
+
 // GET /api/admin/company-settings  — public (invoice pages need it)
 export const getCompanySettings = async (_req: Request, res: Response) => {
   try {
@@ -187,6 +239,10 @@ export const getHomepageConfig = async (req: Request, res: Response) => {
             "FOOTER_CONFIG",
             "NAVBAR_CONFIG",
             "STOREFRONT_THEME",
+            "ACTIVE_OCCASION",
+            "PRE_FOOTER_CONFIG",
+            "FEATURED_CATEGORIES_CONFIG",
+            "CATEGORY_SHAPE",
             ...Object.values(SECTION_TEMPLATE_KEYS),
           ],
         },
@@ -199,6 +255,9 @@ export const getHomepageConfig = async (req: Request, res: Response) => {
     const footerConfig = parseJsonOrDefault(map["FOOTER_CONFIG"], DEFAULT_FOOTER_CONFIG);
     const navbarConfig = parseJsonOrDefault(map["NAVBAR_CONFIG"], DEFAULT_NAVBAR_CONFIG);
     const themeConfig = parseJsonOrDefault(map["STOREFRONT_THEME"], DEFAULT_THEME_CONFIG);
+    const activeOccasionId = map["ACTIVE_OCCASION"] || null;
+    const preFooterConfig = parseJsonOrDefault(map["PRE_FOOTER_CONFIG"], DEFAULT_PRE_FOOTER_CONFIG);
+    const featuredCategoriesConfig = parseJsonOrDefault(map["FEATURED_CATEGORIES_CONFIG"], DEFAULT_FEATURED_CATEGORIES_CONFIG);
     // Plain integers, not JSON — parseInt with a fallback is enough (no parseJsonOrDefault).
     const toTemplateNum = (raw: string | undefined) => {
       const n = raw ? parseInt(raw, 10) : NaN;
@@ -208,16 +267,21 @@ export const getHomepageConfig = async (req: Request, res: Response) => {
     const carouselTemplate = toTemplateNum(map[SECTION_TEMPLATE_KEYS.carousel]);
     const discountTemplate = toTemplateNum(map[SECTION_TEMPLATE_KEYS.discount]);
     const featuredTemplate = toTemplateNum(map[SECTION_TEMPLATE_KEYS.featured]);
+    const categoryShape = map["CATEGORY_SHAPE"] === "circle" ? "circle" : "square";
 
     res.status(200).json({
       heroConfig,
       footerConfig,
       navbarConfig,
       themeConfig,
+      activeOccasionId,
+      preFooterConfig,
+      featuredCategoriesConfig,
       announcementTemplate,
       carouselTemplate,
       discountTemplate,
       featuredTemplate,
+      categoryShape,
     });
   } catch (err: any) {
     logger.error("getHomepageConfig error", err);
@@ -344,12 +408,89 @@ export const updateNavbarConfig = async (req: Request, res: Response) => {
   }
 };
 
+// PUT /api/admin/homepage-config/pre-footer — admin only
+export const updatePreFooterConfig = async (req: Request, res: Response) => {
+  try {
+    const config = req.body as object;
+    const value = JSON.stringify(config);
+
+    // Clean up any replaced or removed images from Cloudinary in pre-footer config
+    const previousSetting = await prisma.appSetting.findUnique({
+      where: { key: "PRE_FOOTER_CONFIG" },
+    });
+    if (previousSetting?.value) {
+      const prevConfig = parseJsonOrDefault<unknown>(previousSetting.value, null);
+      const prevUrls = extractCloudinaryUrls(prevConfig);
+      const newUrls = extractCloudinaryUrls(config);
+      const orphanedUrls = [...prevUrls].filter((url) => !newUrls.has(url));
+
+      if (orphanedUrls.length > 0) {
+        await Promise.allSettled(
+          orphanedUrls.map((url) =>
+            deleteFromCloudinary(url).catch((e: unknown) =>
+              logger.warn("Failed to delete replaced pre-footer image from Cloudinary", { url, error: e }),
+            ),
+          ),
+        );
+      }
+    }
+
+    await prisma.appSetting.upsert({
+      where: { key: "PRE_FOOTER_CONFIG" },
+      update: { value },
+      create: { key: "PRE_FOOTER_CONFIG", value },
+    });
+    await createAuditLog({ req, action: "UPDATE_PRE_FOOTER_CONFIG", entity: "AppSetting", entityId: "PRE_FOOTER_CONFIG" });
+    res.status(200).json({ message: "Pre-footer config updated", preFooterConfig: config });
+  } catch (err: any) {
+    logger.error("updatePreFooterConfig error", err);
+    res.status(500).json({ message: "Error updating pre-footer config" });
+  }
+};
+
+// PUT /api/admin/homepage-config/featured-categories — admin only
+export const updateFeaturedCategoriesConfig = async (req: Request, res: Response) => {
+  try {
+    const config = req.body as object;
+    const value = JSON.stringify(config);
+
+    await prisma.appSetting.upsert({
+      where: { key: "FEATURED_CATEGORIES_CONFIG" },
+      update: { value },
+      create: { key: "FEATURED_CATEGORIES_CONFIG", value },
+    });
+    await createAuditLog({ req, action: "UPDATE_FEATURED_CATEGORIES_CONFIG", entity: "AppSetting", entityId: "FEATURED_CATEGORIES_CONFIG" });
+    res.status(200).json({ message: "Featured categories config updated", featuredCategoriesConfig: config });
+  } catch (err: any) {
+    logger.error("updateFeaturedCategoriesConfig error", err);
+    res.status(500).json({ message: "Error updating featured categories config" });
+  }
+};
+
 // PUT /api/admin/homepage-config/theme  — admin only
 // Stores only the chosen theme's id — the actual token values (colors/fonts) live in
 // frontend/src/utils/themes.ts, so re-tuning a theme's palette later needs no data migration.
 export const updateStorefrontTheme = async (req: Request, res: Response) => {
   try {
-    const config = req.body as { themeId: string };
+    const { themeId, customButtonBg, customButtonText } = req.body as {
+      themeId: string;
+      customButtonBg?: string | null;
+      customButtonText?: string | null;
+    };
+    const sanitizeSolidHex = (hex: string | null | undefined): string | null => {
+      if (!hex || typeof hex !== "string") return null;
+      const trimmed = hex.trim();
+      if (!trimmed || trimmed === "transparent") return null;
+      if (/^#[0-9a-fA-F]{6}$/.test(trimmed) || /^#[0-9a-fA-F]{3}$/.test(trimmed)) {
+        return trimmed;
+      }
+      return null;
+    };
+    const config: StorefrontThemeConfig = {
+      themeId: themeId || "studio-minimal",
+      customButtonBg: sanitizeSolidHex(customButtonBg),
+      customButtonText: sanitizeSolidHex(customButtonText),
+    };
     const value = JSON.stringify(config);
     await prisma.appSetting.upsert({
       where: { key: "STOREFRONT_THEME" },
@@ -361,12 +502,100 @@ export const updateStorefrontTheme = async (req: Request, res: Response) => {
       action: "UPDATE_STOREFRONT_THEME",
       entity: "AppSetting",
       entityId: "STOREFRONT_THEME",
-      details: { themeId: config.themeId },
+      details: {
+        themeId: config.themeId,
+        customButtonBg: config.customButtonBg,
+        customButtonText: config.customButtonText,
+      },
     });
     res.status(200).json({ message: "Storefront theme updated", themeConfig: config });
   } catch (err: any) {
     logger.error("updateStorefrontTheme error", err);
     res.status(500).json({ message: "Error updating storefront theme" });
+  }
+};
+
+// PUT /api/admin/homepage-config/category-shape — admin only
+export const updateCategoryShape = async (req: Request, res: Response) => {
+  try {
+    const { categoryShape } = req.body as { categoryShape?: "square" | "circle" };
+    const shape = categoryShape === "circle" ? "circle" : "square";
+    await prisma.appSetting.upsert({
+      where: { key: "CATEGORY_SHAPE" },
+      update: { value: shape },
+      create: { key: "CATEGORY_SHAPE", value: shape },
+    });
+    await createAuditLog({
+      req,
+      action: "UPDATE_CATEGORY_SHAPE",
+      entity: "AppSetting",
+      entityId: "CATEGORY_SHAPE",
+      details: { categoryShape: shape },
+    });
+    res.status(200).json({ message: "Category shape updated", categoryShape: shape });
+  } catch (err: any) {
+    logger.error("updateCategoryShape error", err);
+    res.status(500).json({ message: "Error updating category shape" });
+  }
+};
+
+// PUT /api/admin/homepage-config/occasion — admin only
+// Controls which festive occasion is currently active across the storefront.
+// Activates festive ambient animations without overriding customer custom hero templates.
+export const updateActiveOccasion = async (req: Request, res: Response) => {
+  try {
+    const { occasionId } = req.body as { occasionId?: string | null };
+    const value = occasionId || "";
+    await prisma.appSetting.upsert({
+      where: { key: "ACTIVE_OCCASION" },
+      update: { value },
+      create: { key: "ACTIVE_OCCASION", value },
+    });
+
+    // Ensure announcement bar contains the matching festive copy for the selected occasion
+    const OCCASION_ANNOUNCEMENT_MAP: Record<string, string> = {
+      diwali:
+        "Happy Diwali! May divine light illuminate your life with joy, peace & prosperity | Special Diwali Festive Offers & Discounts Live Now | Celebrate the Festival of Lights with Handpicked Festive Collections",
+      holi:
+        "Happy Holi! May your life be filled with vibrant colors, joy & laughter | Splash Into The Holi Sale — Special Festive Discounts Inside | Celebrate the Festival of Colors with Radiant Festive Styles",
+      eid:
+        "Eid Mubarak! May divine blessings bring peace, joy & prosperity to your home | Exclusive Eid Festive Wear & Royal Heritage Collections Live Now | Celebrate in Timeless Elegance with Special Eid Offers",
+      onam:
+        "Happy Onam! Celebrating the season of harvest, abundance & togetherness | Special Onam Festive Hampers & Traditional Attire Live Now | Celebrate Kerala's Grand Heritage with Handcrafted Festive Picks",
+      "christmas-new-year":
+        "Merry Christmas & Happy New Year! Wishing you warmth, peace & cheerful holiday spirit | Ring in the New Year in Style — Exclusive Holiday Season Markdowns | Curated Winter Collections & Thoughtful Festive Gifting Live Now",
+      "wedding-season":
+        "Happy Wedding Season! Curated for every celebration, ceremony & reception | The Grand Wedding Edit — Exquisite Ethnic & Bridal Collections Live Now | Celebrate Sacred Unions in Royal Splendor & Handcrafted Luxury",
+      "republic-day":
+        "Happy Republic Day! Proudly celebrating the vibrant spirit & sovereignty of India | Republic Day Grand Sale — Celebrate with Special Storewide Savings | Honoring Indian Heritage & Craftsmanship with Limited-Time Offers",
+      valentines:
+        "Happy Valentine's Day! Curated gifts & romantic styles for the ones you love | Love is in the Details — Special Valentine Gifts & Couple Edits Live Now | Celebrate Your Special Moments with Exclusive Season Markdowns",
+      "sale-event":
+        "Mega Sale Event is Live! Biggest markdowns & seasonal price drops | Up to 70% OFF Everything — Grab Your Favorites While Stocks Last | Limited Time Celebration Deals Across All Product Categories",
+      "summer-coastal":
+        "Happy Summer! Breezy seasonal styles & sun-kissed essentials | Beat the heat in pure comfort with our Coastal Collection | Refresh Your Wardrobe with Light & Airy Seasonal Picks",
+    };
+
+    if (occasionId && OCCASION_ANNOUNCEMENT_MAP[occasionId]) {
+      const announcementVal = OCCASION_ANNOUNCEMENT_MAP[occasionId];
+      await prisma.appSetting.upsert({
+        where: { key: "ANNOUNCEMENT_BAR" },
+        update: { value: announcementVal },
+        create: { key: "ANNOUNCEMENT_BAR", value: announcementVal },
+      });
+    }
+
+    await createAuditLog({
+      req,
+      action: "UPDATE_ACTIVE_OCCASION",
+      entity: "AppSetting",
+      entityId: "ACTIVE_OCCASION",
+      details: { occasionId: occasionId || null },
+    });
+    res.status(200).json({ message: "Active occasion updated", activeOccasionId: occasionId || null });
+  } catch (err: any) {
+    logger.error("updateActiveOccasion error", err);
+    res.status(500).json({ message: "Error updating active occasion" });
   }
 };
 

@@ -170,7 +170,7 @@ export const cartList = async (req: Request, res: Response) => {
     const rawItems = await CartItem
       .find({ cartId: cart._id })
       .populate<{ productId: any }>('productId', 'name price discount image stock isActive categoryId')
-      .populate<{ variantId: any }>('variantId', 'options stock priceOverride discountOverride isActive')
+      .populate<{ variantId: any }>('variantId', 'options stock priceOverride discountOverride isActive image secondaryImage images')
       .lean();
 
     // Validate: remove items whose product no longer exists/is inactive, OR whose
@@ -207,7 +207,8 @@ export const cartList = async (req: Request, res: Response) => {
             // A variant's own discount (e.g. a promo on just one option) wins over
             // the product-level one — see mongoose.ts's ProductVariant.
             discount: variant?.discountOverride ?? prod.discount,
-            image: prod.image,
+            image: variant?.image || prod.image,
+            secondaryImage: variant?.secondaryImage || null,
             stock: variant ? variant.stock : prod.stock,
             isActive: prod.isActive,
             categoryId: prod.categoryId ? String(prod.categoryId) : null,

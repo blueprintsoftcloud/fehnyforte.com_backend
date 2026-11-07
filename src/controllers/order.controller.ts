@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
 import mongoose from "mongoose";
-import { User, Order, Cart, Product, PaymentLog, StaffProfile, Role, OrderStatus, NotificationType } from "../models/mongoose";
+import { User, Order, Cart, Product, PaymentLog, StaffProfile, Role, OrderStatus, NotificationType, Address, OrderItem } from "../models/mongoose";
 import razorpay from "../config/razorpay";
 import { calculateShippingWithConfig } from "../services/shipping.service";
 import { env } from "../config/env";
@@ -496,6 +496,214 @@ export const verifyPayment = async (req: Request, res: Response) => {
   }
 };
 
+// POST /api/order/razorpay-webhook (unauthenticated, signature-verified server-to-server)
+export const handleRazorpayWebhook = async (req: Request, res: Response) => {
+  try {
+    const signature = req.headers["x-razorpay-signature"] as string;
+    if (!signature) {
+      logger.warn("[Razorpay Webhook] Missing x-razorpay-signature header");
+      return res.status(400).json({ message: "Missing webhook signature" });
+    }
+
+    const webhookSecret = env.RAZORPAY_WEBHOOK_SECRET || env.RAZORPAY_KEY_SECRET;
+    const rawPayload = (req as any).rawBody || JSON.stringify(req.body);
+
+    const expectedSignature = crypto
+      .createHmac("sha256", webhookSecret)
+      .update(rawPayload)
+      .digest("hex");
+
+    const isMatch =
+      typeof signature === "string" &&
+      signature.length === expectedSignature.length &&
+      crypto.timingSafeEqual(Buffer.from(signature, "utf-8"), Buffer.from(expectedSignature, "utf-8"));
+
+    if (!isMatch) {
+      logger.warn("[Razorpay Webhook] Signature verification failed");
+      return res.status(400).json({ message: "Invalid webhook signature" });
+    }
+
+    const event = req.body?.event;
+    logger.info(`[Razorpay Webhook] Received valid event: ${event}`);
+
+    // 1. Payment Success: payment.captured or order.paid
+    if (event === "payment.captured" || event === "order.paid") {
+      const paymentEntity = req.body?.payload?.payment?.entity;
+      const orderEntity = req.body?.payload?.order?.entity;
+      const rzpOrderId = paymentEntity?.order_id || orderEntity?.id;
+      const rzpPaymentId = paymentEntity?.id;
+
+      if (!rzpOrderId) {
+        return res.status(200).json({ message: "Acknowledged: no order_id in payload" });
+      }
+
+      const order = await prisma.order.findFirst({
+        where: { razorpayOrderId: rzpOrderId },
+        include: { items: true },
+      });
+
+      if (!order) {
+        logger.warn(`[Razorpay Webhook] No matching order found for razorpayOrderId: ${rzpOrderId}`);
+        return res.status(200).json({ message: "Order not found" });
+      }
+
+      // Idempotency guard: If already marked PAID, return success without duplicate side-effects
+      if (order.paymentStatus === "PAID") {
+        return res.status(200).json({ message: "Order already confirmed and paid", orderId: order.id });
+      }
+
+      const shortId = order.id.slice(-6);
+
+      const updated = await prisma.$transaction(async (tx: typeof prisma) => {
+        const updatedOrder = await tx.order.update({
+          where: { id: order.id, paymentStatus: { not: "PAID" } },
+          data: {
+            paymentStatus: "PAID",
+            orderStatus: "CONFIRMED",
+            razorpayPaymentId: rzpPaymentId || order.razorpayPaymentId,
+            razorpaySignature: signature,
+          },
+        });
+        if (!updatedOrder) return null; // Lost race to concurrent frontend verification call
+
+        await tx.paymentLog.create({
+          data: {
+            orderId: order.id,
+            userId: order.userId,
+            event: "PAYMENT_SUCCESS",
+            razorpayOrderId: rzpOrderId,
+            razorpayPaymentId: rzpPaymentId,
+            razorpaySignature: signature,
+            paymentMethod: "ONLINE",
+            paymentStatus: "PAID",
+            amount: order.finalAmount,
+            signatureValid: true,
+            gatewayResponse: {
+              source: "webhook",
+              event,
+              razorpayOrderId: rzpOrderId,
+              razorpayPaymentId: rzpPaymentId,
+            },
+            ipAddress: req.ip ?? null,
+          },
+        });
+
+        // Clear user's cart
+        await tx.cart.deleteMany({ where: { userId: order.userId } });
+
+        return updatedOrder;
+      });
+
+      if (updated) {
+        void (async () => {
+          try {
+            const user = await prisma.user.findUnique({
+              where: { id: order.userId },
+              select: { username: true, email: true },
+            });
+            const adminIds = await getAdminRecipients();
+            const orderRecipients = await getAdminAndStaffRecipients("ORDER_VIEW");
+            await notifyUsers(req, order.id, `New Order from ${user?.username || "Customer"}: ₹${order.finalAmount}`, "NEW_ORDER", order.userId, orderRecipients);
+            await notifyUsers(req, order.id, `Payment Confirmed: Order #${shortId} by ${user?.username || "Customer"}`, "PAYMENT_SUCCESS", order.userId, adminIds);
+            await notifyUsers(req, order.id, `Success! Payment confirmed for order #${shortId}`, "PAYMENT_SUCCESS", order.userId, [order.userId]);
+
+            if (user?.email) {
+              try {
+                await sendEmail({
+                  to: user.email,
+                  toName: user.username,
+                  ...orderConfirmationEmailPayload(shortId, user.username, updated.finalAmount.toFixed(2), "ONLINE"),
+                });
+                logger.info(`[Razorpay Webhook] Order confirmation email sent to ${user.email}`);
+              } catch (emailErr) {
+                logger.error("[Razorpay Webhook] Order confirmation email failed", emailErr);
+              }
+            }
+          } catch (bgErr) {
+            logger.error("[Razorpay Webhook] Post-processing notification/email error", bgErr);
+          }
+        })();
+      }
+
+      return res.status(200).json({ message: "Payment verified and order confirmed", orderId: order.id });
+    }
+
+    // 2. Payment Failure: payment.failed
+    if (event === "payment.failed") {
+      const paymentEntity = req.body?.payload?.payment?.entity;
+      const rzpOrderId = paymentEntity?.order_id;
+      const rzpPaymentId = paymentEntity?.id;
+
+      if (!rzpOrderId) {
+        return res.status(200).json({ message: "Acknowledged: no order_id in payload" });
+      }
+
+      const order = await prisma.order.findFirst({
+        where: { razorpayOrderId: rzpOrderId },
+        include: { items: true },
+      });
+
+      if (!order) {
+        return res.status(200).json({ message: "Order not found" });
+      }
+
+      // If the order is still waiting in PROCESSING, cancel it and release inventory back
+      if (order.orderStatus === "PROCESSING") {
+        const cancelled = await prisma.order.update({
+          where: { id: order.id, orderStatus: "PROCESSING" },
+          data: {
+            orderStatus: "CANCELLED",
+            paymentStatus: "FAILED",
+          },
+        });
+
+        if (cancelled) {
+          await restoreStock({
+            orderId: order.id,
+            items: order.items.map((item: any) => ({
+              productId: item.productId,
+              variantId: item.variantId ?? null,
+              quantity: item.quantity,
+            })),
+          });
+
+          await prisma.paymentLog.create({
+            data: {
+              orderId: order.id,
+              userId: order.userId,
+              event: "PAYMENT_FAILED",
+              razorpayOrderId: rzpOrderId,
+              razorpayPaymentId: rzpPaymentId,
+              razorpaySignature: signature,
+              paymentMethod: "ONLINE",
+              paymentStatus: "FAILED",
+              amount: order.finalAmount,
+              signatureValid: true,
+              gatewayResponse: {
+                source: "webhook",
+                event,
+                error_code: paymentEntity?.error_code,
+                error_description: paymentEntity?.error_description,
+              },
+              ipAddress: req.ip ?? null,
+            },
+          });
+
+          logger.info(`[Razorpay Webhook] Order #${order.id} marked CANCELLED and stock restored`);
+        }
+      }
+
+      return res.status(200).json({ message: "Payment failure recorded" });
+    }
+
+    // Acknowledge any other events safely with 200
+    return res.status(200).json({ message: `Event ${event} acknowledged` });
+  } catch (err: any) {
+    logger.error("[Razorpay Webhook] Error processing event", err);
+    return res.status(500).json({ message: "Webhook processing error", error: err.message });
+  }
+};
+
 // POST /api/orders/place-pod  (authenticated) — Pay on Delivery
 export const placeOrderPOD = async (req: Request, res: Response) => {
   try {
@@ -744,13 +952,6 @@ export const placeOrderQR = async (req: Request, res: Response) => {
 
     if (req.file) {
       screenshotUrl = await uploadToCloudinary(req.file.buffer, "payment_receipts");
-    }
-
-    if (!trimmedTxId && !screenshotUrl) {
-      res.status(400).json({
-        message: "Please enter your 12-digit UTR or upload a payment screenshot.",
-      });
-      return;
     }
 
     const [address, cart] = await Promise.all([
@@ -1149,7 +1350,7 @@ export const getOrders = async (req: Request, res: Response) => {
 // GET /api/orders/admin?page=1&limit=20&status=&source=&placedBy=&search=  (admin/staff)
 export const getOrdersForAdmin = async (req: Request, res: Response) => {
   try {
-    const { page = "1", limit = "20", status, source, placedBy, search, invoicePrinted } = req.query as Record<string, string | undefined>;
+    const { page = "1", limit = "20", status, source, placedBy, search, invoicePrinted, startDate, endDate } = req.query as Record<string, string | undefined>;
 
     const pageSize = Math.min(Math.max(parseInt(limit ?? "20") || 20, 1), 100);
     const skip = (Math.max(parseInt(page ?? "1") || 1, 1) - 1) * pageSize;
@@ -1173,6 +1374,32 @@ export const getOrdersForAdmin = async (req: Request, res: Response) => {
       where.invoicePrinted = { not: true };
       if (!status) {
         where.orderStatus = { not: "CANCELLED" };
+      }
+    }
+
+    if (startDate && startDate.trim()) {
+      const start = new Date(startDate.trim());
+      if (!isNaN(start.getTime())) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(startDate.trim())) {
+          start.setUTCHours(0, 0, 0, 0);
+        }
+        where.createdAt = {
+          ...(where.createdAt || {}),
+          gte: start,
+        };
+      }
+    }
+
+    if (endDate && endDate.trim()) {
+      const end = new Date(endDate.trim());
+      if (!isNaN(end.getTime())) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(endDate.trim())) {
+          end.setUTCHours(23, 59, 59, 999);
+        }
+        where.createdAt = {
+          ...(where.createdAt || {}),
+          lte: end,
+        };
       }
     }
 
@@ -1303,7 +1530,7 @@ export const getOrdersForAdmin = async (req: Request, res: Response) => {
 // order table can see accurate totals for it.
 export const getOrderStats = async (req: Request, res: Response) => {
   try {
-    const { status, source, placedBy, invoicePrinted } = req.query as Record<string, string | undefined>;
+    const { status, source, placedBy, invoicePrinted, startDate, endDate } = req.query as Record<string, string | undefined>;
     const match: Record<string, any> = {};
 
     if (status) {
@@ -1327,6 +1554,30 @@ export const getOrderStats = async (req: Request, res: Response) => {
       if (!status) {
         match.orderStatus = { $ne: "CANCELLED" };
       }
+    }
+
+    const dateMatch: Record<string, any> = {};
+    if (startDate && startDate.trim()) {
+      const start = new Date(startDate.trim());
+      if (!isNaN(start.getTime())) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(startDate.trim())) {
+          start.setUTCHours(0, 0, 0, 0);
+        }
+        dateMatch.$gte = start;
+      }
+    }
+    if (endDate && endDate.trim()) {
+      const end = new Date(endDate.trim());
+      if (!isNaN(end.getTime())) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(endDate.trim())) {
+          end.setUTCHours(23, 59, 59, 999);
+        }
+        dateMatch.$lte = end;
+      }
+    }
+
+    if (Object.keys(dateMatch).length > 0) {
+      match.createdAt = dateMatch;
     }
 
     const pipeline: any[] = [];
@@ -1362,6 +1613,10 @@ export const getOrderStats = async (req: Request, res: Response) => {
       unprintedMatch.placedByAdminId = { $ne: null };
     } else if (source === "CUSTOMER") {
       unprintedMatch.placedByAdminId = null;
+    }
+
+    if (Object.keys(dateMatch).length > 0) {
+      unprintedMatch.createdAt = dateMatch;
     }
 
     const [facetResult, unprintedCount] = await Promise.all([
@@ -1431,6 +1686,18 @@ export const updateStatus = async (req: Request, res: Response) => {
     }
     if (orderStatus === "DELIVERED" && order.orderStatus !== "SHIPPED") {
       return res.status(400).json({ message: "An order must be marked SHIPPED before it can be marked DELIVERED." });
+    }
+
+    // Guard against fulfilling or shipping unpaid online/QR orders
+    const isOnlinePayment = order.paymentMethod === "ONLINE" || order.paymentMethod === "QR";
+    if (
+      isOnlinePayment &&
+      order.paymentStatus !== "PAID" &&
+      (orderStatus === "CONFIRMED" || orderStatus === "SHIPPED" || orderStatus === "DELIVERED")
+    ) {
+      return res.status(400).json({
+        message: `Cannot update order #${id.slice(-6)} to ${orderStatus}: Payment has not been received (Payment Status is ${order.paymentStatus || "PENDING"}). Online orders must be paid before fulfilling or shipping.`,
+      });
     }
 
     // Resolving the courier before the order update means a bad delivery-partner
@@ -1896,6 +2163,46 @@ export const markInvoicesPrinted = async (req: Request, res: Response) => {
 
 // ─── Admin Place Order on Behalf of Customer ──────────────────────────────────
 
+// Helper: Get recent order delivery address or saved address for a customer
+const getCustomerRecentAddress = async (userId: string | mongoose.Types.ObjectId) => {
+  try {
+    const lastOrder = await Order.findOne({ userId })
+      .sort({ createdAt: -1 })
+      .select("shippingAddress")
+      .lean();
+
+    if (lastOrder?.shippingAddress && (lastOrder.shippingAddress.fullAddress || lastOrder.shippingAddress.address)) {
+      const sa = lastOrder.shippingAddress;
+      return {
+        fullAddress: sa.fullAddress || sa.address || sa.street || "",
+        locality: sa.locality || "",
+        city: sa.city || "",
+        state: sa.state || "",
+        zipCode: sa.zipCode || sa.pincode || sa.pinCode || "",
+        country: sa.country || "India",
+      };
+    }
+
+    const savedAddr = await Address.findOne({ userId })
+      .sort({ isDefault: -1, createdAt: -1 })
+      .lean();
+
+    if (savedAddr && savedAddr.fullAddress) {
+      return {
+        fullAddress: savedAddr.fullAddress || "",
+        locality: (savedAddr as any).locality || "",
+        city: savedAddr.city || "",
+        state: savedAddr.state || "",
+        zipCode: savedAddr.zipCode || "",
+        country: savedAddr.country || "India",
+      };
+    }
+  } catch (err) {
+    logger.warn("getCustomerRecentAddress error", err);
+  }
+  return null;
+};
+
 // GET /api/orders/admin-order/search-customers?q=   (admin / super-admin)
 // Search existing customers by name, phone, or email.
 export const searchCustomersForOrder = async (req: Request, res: Response) => {
@@ -1903,22 +2210,192 @@ export const searchCustomersForOrder = async (req: Request, res: Response) => {
     const q = (req.query.q as string | undefined)?.trim() ?? "";
     if (!q) return res.json({ customers: [] });
 
-    const customers = await prisma.user.findMany({
-      where: {
-        role: "CUSTOMER",
-        OR: [
-          { username: { contains: q, mode: "insensitive" } },
-          { email:    { contains: q, mode: "insensitive" } },
-          { phone:    { contains: q, mode: "insensitive" } },
-        ],
-      },
-      select: { id: true, username: true, email: true, phone: true },
-      take: 10,
-    });
-    res.json({ customers });
+    const customers = await User.find({
+      role: "CUSTOMER",
+      $or: [
+        { username: { $regex: q, $options: "i" } },
+        { email:    { $regex: q, $options: "i" } },
+        { phone:    { $regex: q, $options: "i" } },
+      ],
+    })
+      .select("id username email phone")
+      .limit(10)
+      .lean();
+
+    const customersWithAddress = await Promise.all(
+      customers.map(async (c: any) => {
+        const customerId = c._id ? String(c._id) : String(c.id);
+        const recentAddress = await getCustomerRecentAddress(customerId);
+        return {
+          id: customerId,
+          username: c.username,
+          email: c.email ?? null,
+          phone: c.phone ?? null,
+          recentAddress,
+        };
+      })
+    );
+
+    res.json({ customers: customersWithAddress });
   } catch (err: any) {
     logger.error("searchCustomersForOrder error", err);
     res.status(500).json({ message: "Search failed" });
+  }
+};
+
+// GET /api/orders/admin-order/check-customer?phone=&email=  (admin / super-admin)
+// Check if a customer already exists with the given phone number or email.
+export const checkCustomerExists = async (req: Request, res: Response) => {
+  try {
+    const phone = (req.query.phone as string | undefined)?.trim();
+    const email = (req.query.email as string | undefined)?.trim().toLowerCase();
+
+    if (!phone && !email) {
+      return res.json({ exists: false, customer: null });
+    }
+
+    const conditions: any[] = [];
+    if (phone) conditions.push({ phone });
+    if (email) conditions.push({ email });
+
+    const customer = await User.findOne({
+      role: "CUSTOMER",
+      $or: conditions,
+    })
+      .select("id username email phone")
+      .lean();
+
+    if (customer) {
+      const customerId = customer._id ? String(customer._id) : String(customer.id);
+      const recentAddress = await getCustomerRecentAddress(customerId);
+      const matchType = phone && customer.phone === phone ? "phone" : "email";
+      return res.json({
+        exists: true,
+        matchType,
+        customer: {
+          id: customerId,
+          username: customer.username,
+          email: customer.email ?? null,
+          phone: customer.phone ?? null,
+          recentAddress,
+        },
+      });
+    }
+
+    return res.json({ exists: false, customer: null });
+  } catch (err: any) {
+    logger.error("checkCustomerExists error", err);
+    res.status(500).json({ message: "Customer check failed" });
+  }
+};
+
+// GET /api/orders/admin-order/check-recent-order?customerId=&phone=&email=  (admin / super-admin)
+// Checks if a customer has placed an order in the last 24 hours.
+export const checkRecentOrderForCustomer = async (req: Request, res: Response) => {
+  try {
+    const customerId = (req.query.customerId as string | undefined)?.trim();
+    const phone = (req.query.phone as string | undefined)?.trim();
+    const email = (req.query.email as string | undefined)?.trim().toLowerCase();
+
+    let targetUserId: string | null = null;
+    let customerName: string = "";
+
+    if (customerId) {
+      const user = await User.findById(customerId).select("id username").lean();
+      if (user) {
+        targetUserId = String((user as any)._id || (user as any).id);
+        customerName = (user as any).username;
+      }
+    } else if (phone || email) {
+      const conditions: any[] = [];
+      if (phone) conditions.push({ phone });
+      if (email) conditions.push({ email });
+
+      const user = await User.findOne({
+        role: "CUSTOMER",
+        $or: conditions,
+      }).select("id username").lean();
+
+      if (user) {
+        targetUserId = String((user as any)._id || (user as any).id);
+        customerName = (user as any).username;
+      }
+    }
+
+    if (!targetUserId) {
+      return res.json({ hasRecentOrder: false, order: null });
+    }
+
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const userObjectId = mongoose.Types.ObjectId.isValid(targetUserId)
+      ? new mongoose.Types.ObjectId(targetUserId)
+      : targetUserId;
+
+    const recentOrder = await Order.findOne({
+      userId: { $in: [userObjectId, String(targetUserId)] },
+      createdAt: { $gte: twentyFourHoursAgo },
+      orderStatus: { $ne: "CANCELLED" },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!recentOrder) {
+      return res.json({ hasRecentOrder: false, order: null });
+    }
+
+    const recentOrderId = String((recentOrder as any)._id || (recentOrder as any).id);
+
+    const recentItems = await OrderItem.find({ orderId: (recentOrder as any)._id })
+      .populate<{ productId: { name: string } }>("productId", "name")
+      .lean();
+
+    const itemsSummary = recentItems
+      .map((i: any) => `${i.productId?.name || "Item"} (x${i.quantity})`)
+      .join(", ") || `${recentItems.length || 1} item(s)`;
+
+    const orderDate = new Date(recentOrder.createdAt);
+    const formattedTime = orderDate.toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    });
+
+    const diffMs = Math.max(0, Date.now() - orderDate.getTime());
+    const diffMins = Math.floor(diffMs / 60000);
+    const hours = Math.floor(diffMins / 60);
+    const mins = diffMins % 60;
+    let relativeTime = "Just now";
+    if (hours > 0) {
+      relativeTime = `${hours} hr${hours > 1 ? "s" : ""}${mins > 0 ? ` ${mins} min${mins > 1 ? "s" : ""}` : ""} ago`;
+    } else if (diffMins > 0) {
+      relativeTime = `${diffMins} min${diffMins > 1 ? "s" : ""} ago`;
+    }
+
+    return res.json({
+      hasRecentOrder: true,
+      order: {
+        id: recentOrderId,
+        shortId: recentOrderId.slice(-6).toUpperCase(),
+        createdAt: recentOrder.createdAt,
+        formattedTime,
+        relativeTime,
+        finalAmount: recentOrder.finalAmount,
+        totalAmount: recentOrder.totalAmount,
+        orderStatus: recentOrder.orderStatus,
+        paymentMethod: recentOrder.paymentMethod,
+        placedByAdmin: !!(recentOrder as any).placedByAdminId,
+        itemsCount: recentItems.length,
+        itemsSummary,
+        customerName: customerName || ((recentOrder as any).shippingAddress?.fullName || "Customer"),
+      },
+    });
+  } catch (err: any) {
+    logger.error("checkRecentOrderForCustomer error", err);
+    res.status(500).json({ message: "Failed to check recent order" });
   }
 };
 
@@ -1938,7 +2415,7 @@ export const getProductsForAdminOrder = async (req: Request, res: Response) => {
       prisma.product.findMany({
         where,
         select: {
-          id: true, name: true, code: true, image: true, price: true, stock: true,
+          id: true, name: true, code: true, image: true, description: true, price: true, stock: true,
           category: { select: { id: true, name: true } },
         },
         orderBy: { name: "asc" },
@@ -1999,14 +2476,16 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
       paymentMethod = "CASH",
       paymentNote,
       couponId,
+      bypassRecentOrderWarning,
     } = req.body as {
       customerId?: string;
       newCustomer?: { username: string; phone: string; email?: string };
       items: Array<{ productId: string; variantId?: string | null; quantity: number }>;
-      address: { fullAddress: string; city: string; state: string; zipCode: string; country: string };
+      address?: { fullAddress?: string; locality?: string; city?: string; state?: string; zipCode?: string; country?: string };
       paymentMethod: "CASH" | "POD";
       paymentNote?: string;
       couponId?: string;
+      bypassRecentOrderWarning?: boolean;
     };
 
     // ── 1. Resolve customer ──────────────────────────────────────────────────
@@ -2015,7 +2494,7 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
     if (customerId) {
       const existing = await prisma.user.findUnique({
         where: { id: customerId },
-        select: { id: true, username: true, email: true, role: true },
+        select: { id: true, username: true, email: true, phone: true, role: true },
       });
       if (!existing || existing.role !== "CUSTOMER") {
         return res.status(404).json({ message: "Customer not found" });
@@ -2025,24 +2504,150 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
       if (!newCustomer.username?.trim() || !newCustomer.phone?.trim()) {
         return res.status(400).json({ message: "Name and phone are required for a new customer" });
       }
-      // Check if phone already exists
-      const phoneExists = await prisma.user.findUnique({ where: { phone: newCustomer.phone } });
-      if (phoneExists) {
-        return res.status(400).json({ message: "A customer with this phone number already exists. Use existing customer search." });
-      }
-      const created = await prisma.user.create({
-        data: {
-          username: newCustomer.username.trim(),
-          phone: newCustomer.phone.trim(),
-          email: newCustomer.email?.trim().toLowerCase() || null,
-          role: "CUSTOMER",
-          isVerified: true,
-        },
-        select: { id: true, username: true, email: true },
+      const cleanPhone = newCustomer.phone.trim();
+      const cleanEmail = newCustomer.email?.trim().toLowerCase() || null;
+
+      // Check if phone or email already exists
+      let existingUser = await prisma.user.findFirst({
+        where: { phone: cleanPhone },
+        select: { id: true, username: true, email: true, phone: true, role: true },
       });
+
+      if (!existingUser && cleanEmail) {
+        existingUser = await prisma.user.findFirst({
+          where: { email: cleanEmail },
+          select: { id: true, username: true, email: true, phone: true, role: true },
+        });
+      }
+
+      if (existingUser) {
+        const isPhoneMatch = existingUser.phone === cleanPhone;
+        return res.status(409).json({
+          code: "CUSTOMER_ALREADY_EXISTS",
+          message: isPhoneMatch
+            ? "A customer with this phone number already exists."
+            : "A customer with this email address already exists.",
+          conflictField: isPhoneMatch ? "phone" : "email",
+          existingCustomer: {
+            id: existingUser.id,
+            username: existingUser.username,
+            phone: existingUser.phone,
+            email: existingUser.email,
+          },
+        });
+      }
+
+      let created;
+      try {
+        created = await prisma.user.create({
+          data: {
+            username: newCustomer.username.trim(),
+            phone: cleanPhone,
+            email: cleanEmail,
+            role: "CUSTOMER",
+            isVerified: true,
+          },
+          select: { id: true, username: true, email: true, phone: true },
+        });
+      } catch (createErr: any) {
+        if (createErr.code === 11000 || createErr.message?.includes("duplicate")) {
+          const fallbackUser = await prisma.user.findFirst({
+            where: {
+              OR: [
+                { phone: cleanPhone },
+                ...(cleanEmail ? [{ email: cleanEmail }] : []),
+              ],
+            },
+            select: { id: true, username: true, email: true, phone: true },
+          });
+          if (fallbackUser) {
+            return res.status(409).json({
+              code: "CUSTOMER_ALREADY_EXISTS",
+              message: "A customer with these details already exists.",
+              conflictField: "phone",
+              existingCustomer: {
+                id: fallbackUser.id,
+                username: fallbackUser.username,
+                phone: fallbackUser.phone,
+                email: fallbackUser.email,
+              },
+            });
+          }
+        }
+        throw createErr;
+      }
       customer = created;
     } else {
       return res.status(400).json({ message: "Provide either customerId or newCustomer details" });
+    }
+
+    // ── 1b. Check if customer already placed an order in the last 24 hours ────
+    if (!bypassRecentOrderWarning) {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const userObjectId = mongoose.Types.ObjectId.isValid(customer.id)
+        ? new mongoose.Types.ObjectId(customer.id)
+        : customer.id;
+
+      const recentOrder = await Order.findOne({
+        userId: { $in: [userObjectId, String(customer.id)] },
+        createdAt: { $gte: twentyFourHoursAgo },
+        orderStatus: { $ne: "CANCELLED" },
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+
+      if (recentOrder) {
+        const recentOrderId = String((recentOrder as any)._id || (recentOrder as any).id);
+        const recentItems = await OrderItem.find({ orderId: (recentOrder as any)._id })
+          .populate<{ productId: { name: string } }>("productId", "name")
+          .lean();
+
+        const itemsSummary = recentItems
+          .map((i: any) => `${i.productId?.name || "Item"} (x${i.quantity})`)
+          .join(", ") || `${recentItems.length || 1} item(s)`;
+
+        const orderDate = new Date(recentOrder.createdAt);
+        const formattedTime = orderDate.toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: true,
+        });
+
+        const diffMs = Math.max(0, Date.now() - orderDate.getTime());
+        const diffMins = Math.floor(diffMs / 60000);
+        const hours = Math.floor(diffMins / 60);
+        const mins = diffMins % 60;
+        let relativeTime = "Just now";
+        if (hours > 0) {
+          relativeTime = `${hours} hr${hours > 1 ? "s" : ""}${mins > 0 ? ` ${mins} min${mins > 1 ? "s" : ""}` : ""} ago`;
+        } else if (diffMins > 0) {
+          relativeTime = `${diffMins} min${diffMins > 1 ? "s" : ""} ago`;
+        }
+
+        return res.status(409).json({
+          code: "RECENT_ORDER_EXISTS_24H",
+          message: "This customer has already placed an order in the last 24 hours.",
+          recentOrder: {
+            id: recentOrderId,
+            shortId: recentOrderId.slice(-6).toUpperCase(),
+            createdAt: recentOrder.createdAt,
+            formattedTime,
+            relativeTime,
+            finalAmount: recentOrder.finalAmount,
+            totalAmount: recentOrder.totalAmount,
+            orderStatus: recentOrder.orderStatus,
+            paymentMethod: recentOrder.paymentMethod,
+            placedByAdmin: !!(recentOrder as any).placedByAdminId,
+            itemsCount: recentItems.length,
+            itemsSummary,
+            customerName: customer.username,
+          },
+        });
+      }
     }
 
     // ── 2. Validate + price items ────────────────────────────────────────────
@@ -2119,11 +2724,12 @@ export const placeAdminOrder = async (req: Request, res: Response) => {
           orderStatus: "CONFIRMED",
           couponId: resolvedCouponId,
           shippingAddress: {
-            fullAddress: address.fullAddress,
-            city: address.city,
-            state: address.state,
-            zipCode: address.zipCode,
-            country: address.country || "India",
+            fullAddress: address?.fullAddress?.trim() || "",
+            locality: address?.locality?.trim() || undefined,
+            city: address?.city?.trim() || "",
+            state: address?.state?.trim() || "",
+            zipCode: address?.zipCode?.trim() || "",
+            country: address?.country?.trim() || "India",
           },
           items: { create: orderItems },
         },
@@ -2253,7 +2859,8 @@ export const lookupPincode = async (req: Request, res: Response) => {
           const fetchedDistrict = (po.District && po.District !== "NA") ? po.District : "";
           const fetchedCity = fetchedDistrict || po.Block || po.Name || "";
           const fetchedState = po.State || "";
-          return res.json({ success: true, city: fetchedCity, district: fetchedDistrict, state: fetchedState });
+          const localities = Array.from(new Set(postOffices.map((p: any) => (p?.Name || "").trim()).filter(Boolean))).sort();
+          return res.json({ success: true, city: fetchedCity, district: fetchedDistrict, state: fetchedState, localities });
         }
       }
     }

@@ -1,16 +1,18 @@
 import { Request, Response } from "express";
-import { Product, Category, ProductAttributeValue } from "../models/mongoose";
+import mongoose from "mongoose";
+import { Product, Category, ProductAttributeValue, OrderItem, ProductVariant } from "../models/mongoose";
 import { deleteFromCloudinary, uploadToCloudinary } from "../config/cloudinary";
 import logger from "../utils/logger";
 import { createAuditLog } from "../utils/auditLog";
 import { sanitizeRichText } from "../utils/sanitizeHtml";
 import { categoryHasSubcategories } from "../utils/categoryTree";
 import { buildAttributeValueWhereConditions } from "../utils/attributeFilter";
+import { syncProductFromVariants } from "../utils/productVariant";
 
-// GET /api/products/list?categoryId=xxx&page=1&limit=20&status=all|active|disabled|out_of_stock&q=&attributeValueIds=  (admin)
+// GET /api/products/list?categoryId=xxx&page=1&limit=20&status=all|active|disabled|out_of_stock&q=&attributeValueIds=&sortBy=  (admin)
 export const productList = async (req: Request, res: Response) => {
   try {
-    const { categoryId, page = "1", limit = "20", status, q, attributeValueIds } =
+    const { categoryId, page = "1", limit = "20", status, q, attributeValueIds, sortBy, sort } =
       req.query as Record<string, string | undefined>;
 
     const pageSize = Math.min(Math.max(parseInt(limit ?? "20") || 20, 1), 100);
@@ -37,6 +39,37 @@ export const productList = async (req: Request, res: Response) => {
       }
     }
 
+    const sortOption = sortBy || sort || "newest";
+    let orderBy: Prisma.ProductOrderByWithRelationInput | Prisma.ProductOrderByWithRelationInput[] = { createdAt: "desc" };
+
+    switch (sortOption) {
+      case "stock_asc":
+        orderBy = [{ stock: "asc" }, { name: "asc" }];
+        break;
+      case "stock_desc":
+        orderBy = [{ stock: "desc" }, { name: "asc" }];
+        break;
+      case "name_asc":
+        orderBy = [{ name: "asc" }];
+        break;
+      case "name_desc":
+        orderBy = [{ name: "desc" }];
+        break;
+      case "price_asc":
+        orderBy = [{ price: "asc" }];
+        break;
+      case "price_desc":
+        orderBy = [{ price: "desc" }];
+        break;
+      case "oldest":
+        orderBy = [{ createdAt: "asc" }];
+        break;
+      case "newest":
+      default:
+        orderBy = [{ createdAt: "desc" }];
+        break;
+    }
+
     const [list, total] = await Promise.all([
       prisma.product.findMany({
         where,
@@ -50,7 +83,7 @@ export const productList = async (req: Request, res: Response) => {
             },
           },
         },
-        orderBy: { createdAt: "desc" },
+        orderBy,
         skip,
         take: pageSize,
       }),
@@ -104,7 +137,7 @@ export const productList = async (req: Request, res: Response) => {
 // POST /api/products/add  (admin)
 export const productAdd = async (req: Request, res: Response) => {
   try {
-    const { code, name, description, price, purchasePrice, category, stock, discount, brand, metaTitle, metaDescription } = req.body;
+    const { code, name, description, price, purchasePrice, category, stock, discount, brand, metaTitle, metaDescription, materialCare } = req.body;
     const sizesRaw = req.body.sizes;
     const sizes: string[] = Array.isArray(sizesRaw) ? sizesRaw : (sizesRaw ? [sizesRaw] : []);
 
@@ -157,6 +190,31 @@ export const productAdd = async (req: Request, res: Response) => {
         brand: brand ?? null,
         metaTitle: metaTitle ?? null,
         metaDescription: metaDescription ?? null,
+        materialCare: materialCare ? String(materialCare).trim() : null,
+        customSections: (() => {
+          if (!req.body.customSections) return [];
+          try {
+            const raw = typeof req.body.customSections === "string" ? JSON.parse(req.body.customSections) : req.body.customSections;
+            return Array.isArray(raw)
+              ? raw
+                  .filter((s: any) => s && typeof s.heading === "string" && s.heading.trim() && typeof s.content === "string" && s.content.trim())
+                  .map((s: any) => ({ heading: s.heading.trim(), content: s.content.trim() }))
+              : [];
+          } catch {
+            return [];
+          }
+        })(),
+        specifications: (() => {
+          if (!req.body.specifications) return [];
+          try {
+            const raw = typeof req.body.specifications === "string" ? JSON.parse(req.body.specifications) : req.body.specifications;
+            return Array.isArray(raw)
+              ? raw.filter((s: any) => s && typeof s.key === "string" && s.key.trim() && typeof s.value === "string" && s.value.trim()).map((s: any) => ({ key: s.key.trim(), value: s.value.trim() }))
+              : [];
+          } catch {
+            return [];
+          }
+        })(),
         price: parseFloat(price),
         purchasePrice: purchasePrice != null ? parseFloat(purchasePrice) : null,
         categoryId: category,
@@ -233,7 +291,7 @@ export const productAdd = async (req: Request, res: Response) => {
 export const productUpdate = async (req: Request, res: Response) => {
   try {
     const id = req.params.id as string;
-    const { code, name, description, price, purchasePrice, category, stock, discount, brand, metaTitle, metaDescription } = req.body;
+    const { code, name, description, price, purchasePrice, category, stock, discount, brand, metaTitle, metaDescription, materialCare } = req.body;
     const sizesRaw = req.body.sizes;
     const sizes: string[] | undefined = sizesRaw !== undefined
       ? (Array.isArray(sizesRaw) ? sizesRaw : [sizesRaw])
@@ -338,9 +396,32 @@ export const productUpdate = async (req: Request, res: Response) => {
         code: code ?? existing.code,
         name: name ?? existing.name,
         description: description !== undefined ? sanitizeRichText(description) : existing.description,
-        brand: brand !== undefined ? brand : existing.brand,
+        brand: brand !== undefined ? (brand.trim() || null) : existing.brand,
         metaTitle: metaTitle !== undefined ? metaTitle : existing.metaTitle,
         metaDescription: metaDescription !== undefined ? metaDescription : existing.metaDescription,
+        materialCare: req.body.materialCare !== undefined ? (req.body.materialCare ? String(req.body.materialCare).trim() : null) : existing.materialCare,
+        customSections: req.body.customSections !== undefined ? (() => {
+          try {
+            const raw = typeof req.body.customSections === "string" ? JSON.parse(req.body.customSections) : req.body.customSections;
+            return Array.isArray(raw)
+              ? raw
+                  .filter((s: any) => s && typeof s.heading === "string" && s.heading.trim() && typeof s.content === "string" && s.content.trim())
+                  .map((s: any) => ({ heading: s.heading.trim(), content: s.content.trim() }))
+              : [];
+          } catch {
+            return [];
+          }
+        })() : (existing as any).customSections,
+        specifications: req.body.specifications !== undefined ? (() => {
+          try {
+            const raw = typeof req.body.specifications === "string" ? JSON.parse(req.body.specifications) : req.body.specifications;
+            return Array.isArray(raw)
+              ? raw.filter((s: any) => s && typeof s.key === "string" && s.key.trim() && typeof s.value === "string" && s.value.trim()).map((s: any) => ({ key: s.key.trim(), value: s.value.trim() }))
+              : [];
+          } catch {
+            return [];
+          }
+        })() : existing.specifications,
         price: priceInput ? parseFloat(priceInput) : existing.price,
         purchasePrice: purchasePriceInput !== undefined ? (purchasePriceInput !== null ? parseFloat(purchasePriceInput) : null) : existing.purchasePrice,
         categoryId: category ?? existing.categoryId,
@@ -382,6 +463,10 @@ export const productUpdate = async (req: Request, res: Response) => {
     }
 
     await createAuditLog({ req, action: "UPDATE_PRODUCT", entity: "Product", entityId: updated.id, details: { code: updated.code, name: updated.name, price: updated.price, purchasePrice: updated.purchasePrice } });
+
+    if (hasActiveVariants) {
+      await syncProductFromVariants(updated.id);
+    }
 
     // `updated` predates the attribute-value delete+recreate above (and never even
     // included attributeValues to begin with) — re-fetch so the response reflects
@@ -454,17 +539,26 @@ export const productDelete = async (req: Request, res: Response) => {
     // Remove from wishlists
     await prisma.wishlist.deleteMany({ where: { productId: id } });
 
-    // Delete main image + every gallery image from Cloudinary — previously only the
-    // main image was cleaned up, leaving every gallery image permanently orphaned.
-    const imagesToDelete = [product.image, ...(product.images ?? [])].filter(Boolean) as string[];
+    // Delete main image + every gallery image + all variant images from Cloudinary
+    const variants = await prisma.productVariant.findMany({ where: { productId: id } });
+    const variantImagesToDelete = variants
+      .flatMap((v: any) => [v.image, v.secondaryImage, ...(v.images ?? [])])
+      .filter(Boolean) as string[];
+
+    const imagesToDelete = [
+      ...new Set([product.image, ...(product.images ?? []), ...variantImagesToDelete].filter(Boolean) as string[]),
+    ];
+
     await Promise.all(
       imagesToDelete.map((url) =>
         deleteFromCloudinary(url).catch((e: unknown) =>
-          logger.warn("Failed to delete product image from Cloudinary", e),
+          logger.warn("Failed to delete product/variant image from Cloudinary", e),
         ),
       ),
     );
 
+    // Delete variant records before product delete
+    await prisma.productVariant.deleteMany({ where: { productId: id } });
     await prisma.product.delete({ where: { id } });
     await createAuditLog({ req, action: "DELETE_PRODUCT", entity: "Product", entityId: id, details: { code: product.code, name: product.name } });
 
@@ -512,6 +606,328 @@ export const productToggleStatus = async (req: Request, res: Response) => {
   } catch (err: any) {
     logger.error("productToggleStatus error", err);
     res.status(500).json({ message: "Error toggling product status", error: err.message });
+  }
+};
+
+// GET /api/product/stock-summary (admin)
+export const adminStockSummary = async (req: Request, res: Response) => {
+  try {
+    const [allProducts, variants] = await Promise.all([
+      Product.find({}).select("id _id name stock stockQuantity price basePrice purchasePrice isActive").lean(),
+      ProductVariant.find({}).select("id _id productId stock priceOverride isActive").lean(),
+    ]);
+
+    const totalProducts = allProducts.length;
+    let inStockProducts = 0;
+    let lowStockProducts = 0;
+    let outOfStockProducts = 0;
+    let activeProducts = 0;
+    let totalInventoryUnits = 0;
+    let totalInventoryValue = 0;
+
+    for (const p of allProducts as any[]) {
+      if (p.isActive) activeProducts++;
+      const stock = typeof p.stock === "number" ? p.stock : (p.stockQuantity ?? 0);
+      totalInventoryUnits += Math.max(0, stock);
+      const unitCost = p.purchasePrice ?? p.price ?? 0;
+      totalInventoryValue += Math.max(0, stock) * unitCost;
+
+      if (stock <= 0) {
+        outOfStockProducts++;
+      } else if (stock <= 5) {
+        lowStockProducts++;
+      } else {
+        inStockProducts++;
+      }
+    }
+
+    res.status(200).json({
+      summary: {
+        totalProducts,
+        activeProducts,
+        inStockProducts,
+        lowStockProducts,
+        outOfStockProducts,
+        totalVariants: variants.length,
+        totalInventoryUnits,
+        totalInventoryValue: Math.round(totalInventoryValue),
+      },
+    });
+  } catch (err: any) {
+    logger.error("adminStockSummary error", err);
+    res.status(500).json({ message: "Error loading inventory summary", error: err.message });
+  }
+};
+
+// GET /api/product/detail/:id (admin)
+export const productAdminDetail = async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const { from, to } = req.query as { from?: string; to?: string };
+
+    const product = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        category: { select: { id: true, name: true, image: true } },
+        attributeValues: {
+          include: {
+            attribute: { select: { id: true, name: true, type: true } },
+            attributeValue: { select: { id: true, value: true } },
+            variant: { select: { id: true, options: true } },
+          },
+        },
+      },
+    });
+
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const variants = await prisma.productVariant.findMany({
+      where: { productId: id },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Parse selective date range if provided
+    const fromDate = from && !isNaN(new Date(from).getTime()) ? new Date(from) : undefined;
+    const toDate = to && !isNaN(new Date(to).getTime()) ? new Date(new Date(to).setHours(23, 59, 59, 999)) : undefined;
+    const hasDateFilter = Boolean(fromDate || toDate);
+
+    const dateMatchStage: Record<string, any> = {};
+    if (fromDate || toDate) {
+      dateMatchStage["order.createdAt"] = {};
+      if (fromDate) dateMatchStage["order.createdAt"].$gte = fromDate;
+      if (toDate) dateMatchStage["order.createdAt"].$lte = toDate;
+    }
+
+    // Compute sales metrics and monthly breakdown from OrderItem
+    let salesStats: {
+      totalUnitsSold: number;
+      totalRevenue: number;
+      totalOrdersCount: number;
+      lifetimeUnitsSold: number;
+      lifetimeRevenue: number;
+      lifetimeOrdersCount: number;
+      isFiltered: boolean;
+      fromDate?: string | null;
+      toDate?: string | null;
+    } = {
+      totalUnitsSold: 0,
+      totalRevenue: 0,
+      totalOrdersCount: 0,
+      lifetimeUnitsSold: 0,
+      lifetimeRevenue: 0,
+      lifetimeOrdersCount: 0,
+      isFiltered: hasDateFilter,
+      fromDate: fromDate?.toISOString() ?? null,
+      toDate: toDate?.toISOString() ?? null,
+    };
+
+    let monthlyBreakdown: Array<{
+      month: string;
+      monthName: string;
+      unitsSold: number;
+      revenue: number;
+      ordersCount: number;
+    }> = [];
+
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      try {
+        const aggResult = await OrderItem.aggregate([
+          { $match: { productId: new mongoose.Types.ObjectId(id) } },
+          {
+            $lookup: {
+              from: "orders",
+              localField: "orderId",
+              foreignField: "_id",
+              as: "order",
+            },
+          },
+          { $unwind: "$order" },
+          { $match: { "order.orderStatus": { $nin: ["CANCELLED", "RETURNED"] } } },
+          {
+            $facet: {
+              lifetimeSummary: [
+                {
+                  $group: {
+                    _id: null,
+                    totalUnitsSold: { $sum: "$quantity" },
+                    totalRevenue: { $sum: { $multiply: ["$quantity", "$price"] } },
+                    totalOrders: { $addToSet: "$orderId" },
+                  },
+                },
+              ],
+              filteredSummary: [
+                ...(hasDateFilter ? [{ $match: dateMatchStage }] : []),
+                {
+                  $group: {
+                    _id: null,
+                    totalUnitsSold: { $sum: "$quantity" },
+                    totalRevenue: { $sum: { $multiply: ["$quantity", "$price"] } },
+                    totalOrders: { $addToSet: "$orderId" },
+                  },
+                },
+              ],
+              monthlyBreakdown: [
+                ...(hasDateFilter ? [{ $match: dateMatchStage }] : []),
+                {
+                  $group: {
+                    _id: {
+                      $dateToString: { format: "%Y-%m", date: "$order.createdAt" },
+                    },
+                    unitsSold: { $sum: "$quantity" },
+                    revenue: { $sum: { $multiply: ["$quantity", "$price"] } },
+                    totalOrders: { $addToSet: "$orderId" },
+                  },
+                },
+                { $sort: { _id: -1 } },
+                {
+                  $project: {
+                    _id: 0,
+                    month: "$_id",
+                    unitsSold: 1,
+                    revenue: { $round: ["$revenue", 2] },
+                    ordersCount: { $size: "$totalOrders" },
+                  },
+                },
+              ],
+            },
+          },
+        ]);
+
+        if (aggResult && aggResult[0]) {
+          const { lifetimeSummary, filteredSummary, monthlyBreakdown: months } = aggResult[0];
+
+          const lifeUnits = lifetimeSummary?.[0]?.totalUnitsSold ?? 0;
+          const lifeRev = Math.round(lifetimeSummary?.[0]?.totalRevenue ?? 0);
+          const lifeOrders = Array.isArray(lifetimeSummary?.[0]?.totalOrders)
+            ? lifetimeSummary[0].totalOrders.length
+            : 0;
+
+          const filtUnits = filteredSummary?.[0]?.totalUnitsSold ?? (hasDateFilter ? 0 : lifeUnits);
+          const filtRev = Math.round(filteredSummary?.[0]?.totalRevenue ?? (hasDateFilter ? 0 : lifeRev));
+          const filtOrders = Array.isArray(filteredSummary?.[0]?.totalOrders)
+            ? filteredSummary[0].totalOrders.length
+            : (hasDateFilter ? 0 : lifeOrders);
+
+          salesStats = {
+            totalUnitsSold: filtUnits,
+            totalRevenue: filtRev,
+            totalOrdersCount: filtOrders,
+            lifetimeUnitsSold: lifeUnits,
+            lifetimeRevenue: lifeRev,
+            lifetimeOrdersCount: lifeOrders,
+            isFiltered: hasDateFilter,
+            fromDate: fromDate?.toISOString() ?? null,
+            toDate: toDate?.toISOString() ?? null,
+          };
+
+          const monthNames = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+          ];
+
+          monthlyBreakdown = (months || []).map((m: any) => {
+            let monthName = m.month || "Unknown";
+            if (typeof m.month === "string" && m.month.includes("-")) {
+              const [year, monthNum] = m.month.split("-");
+              const idx = parseInt(monthNum, 10) - 1;
+              if (idx >= 0 && idx < 12) {
+                monthName = `${monthNames[idx]} ${year}`;
+              }
+            }
+            return {
+              month: m.month,
+              monthName,
+              unitsSold: m.unitsSold ?? 0,
+              revenue: Math.round(m.revenue ?? 0),
+              ordersCount: m.ordersCount ?? 0,
+            };
+          });
+        }
+      } catch (salesErr) {
+        logger.warn("productAdminDetail: salesAggregate failed, falling back to 0", salesErr);
+      }
+    }
+
+    res.status(200).json({
+      product,
+      variants,
+      salesStats,
+      monthlyBreakdown,
+    });
+  } catch (err: any) {
+    logger.error("productAdminDetail error", err);
+    res.status(500).json({ message: "Error fetching product details", error: err.message });
+  }
+};
+
+
+// PATCH /api/product/:id/quick-stock (admin)
+export const quickStockUpdate = async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id as string;
+    const { stock, variantStocks } = req.body as {
+      stock?: number;
+      variantStocks?: Record<string, number>;
+    };
+
+    const product = await prisma.product.findUnique({ where: { id } });
+    if (!product) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const hasVariants = (await prisma.productVariant.count({ where: { productId: id } })) > 0;
+
+    if (hasVariants && variantStocks && typeof variantStocks === "object") {
+      // Update individual variant stocks
+      for (const [vId, vStock] of Object.entries(variantStocks)) {
+        if (typeof vStock === "number" && vStock >= 0) {
+          await prisma.productVariant.update({
+            where: { id: vId },
+            data: { stock: Math.floor(vStock) },
+          });
+        }
+      }
+      await syncProductFromVariants(id);
+    } else if (typeof stock === "number" && stock >= 0) {
+      await prisma.product.update({
+        where: { id },
+        data: { stock: Math.floor(stock), stockQuantity: Math.floor(stock) },
+      });
+    }
+
+    await createAuditLog({
+      req,
+      action: "UPDATE_PRODUCT_STOCK",
+      entity: "Product",
+      entityId: id,
+      details: {
+        productName: product.name,
+        newStock: stock,
+        variantStocks,
+      },
+    });
+
+    const updated = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        category: { select: { id: true, name: true } },
+      },
+    });
+
+    const updatedVariants = await prisma.productVariant.findMany({
+      where: { productId: id },
+    });
+
+    res.status(200).json({
+      message: "Stock updated successfully",
+      product: updated,
+      variants: updatedVariants,
+    });
+  } catch (err: any) {
+    logger.error("quickStockUpdate error", err);
+    res.status(500).json({ message: "Error updating stock", error: err.message });
   }
 };
 

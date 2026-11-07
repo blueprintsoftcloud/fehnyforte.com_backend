@@ -17,9 +17,11 @@ async function createAllSchemas() {
     console.log(`Found ${modelsToInit.length} models to initialize.\n`);
 
     for (const [name, Model] of modelsToInit) {
-      console.log(`📋 Initializing collection and building indexes for model: ${name}...`);
+      console.log(`📋 Initializing and building indexes for model: ${name}...`);
       try {
-        await (Model as any).createCollection();
+        if (typeof (Model as any).createCollection === "function") {
+          await (Model as any).createCollection();
+        }
         await (Model as any).createIndexes();
         console.log(`   ✅ ${name} collection and indexes initialized.`);
       } catch (err: any) {

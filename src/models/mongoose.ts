@@ -38,6 +38,9 @@ export interface IUser extends Document {
   avatar?: string;
   /** Refresh-token-reuse detection: the token family id currently valid for this user. */
   refreshTokenFamily?: string;
+  previousRefreshToken?: string;
+  previousRefreshTokens?: Array<{ token: string; rotatedAt: Date }>;
+  lastRotatedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -52,6 +55,14 @@ const UserSchema = new Schema<IUser>(
     isVerified: { type: Boolean, default: false },
     refreshToken: String,
     refreshTokenFamily: String,
+    previousRefreshToken: String,
+    previousRefreshTokens: [
+      {
+        token: { type: String },
+        rotatedAt: { type: Date, default: Date.now },
+      },
+    ],
+    lastRotatedAt: Date,
     avatar: String,
   },
   { timestamps: true }
@@ -69,6 +80,7 @@ export interface IAddress extends Document {
   state: string;
   zipCode: string;
   country: string;
+  locality?: string;
   landmark?: string;
   isDefault: boolean;
   latitude?: number;
@@ -85,6 +97,7 @@ const AddressSchema = new Schema<IAddress>(
     state: { type: String, required: true },
     zipCode: { type: String, required: true },
     country: { type: String, default: 'India' },
+    locality: String,
     landmark: String,
     isDefault: { type: Boolean, default: false },
     latitude: Number,
@@ -113,6 +126,8 @@ export interface ICategory extends Document {
   /** Left-to-right position among top-level categories in the mega menu. Ties broken
    * by name. Irrelevant for subcategories. */
   navOrder: number;
+  /** Whether sidebar filters (price, ratings, attributes) are shown on this category's storefront page */
+  showFilters: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -127,6 +142,7 @@ const CategorySchema = new Schema<ICategory>(
     parentId: { type: Schema.Types.ObjectId, ref: 'Category', default: null },
     showInNav: { type: Boolean, default: true },
     navOrder: { type: Number, default: 0 },
+    showFilters: { type: Boolean, default: true },
   },
   { timestamps: true }
 );
@@ -155,6 +171,16 @@ export const DeliveryPartner = mongoose.model<IDeliveryPartner>('DeliveryPartner
 
 // ───────────────────────────── PRODUCT ───────────────────────────────
 
+export interface IProductSpecification {
+  key: string;
+  value: string;
+}
+
+export interface IProductCustomSection {
+  heading: string;
+  content: string;
+}
+
 export interface IProduct extends Document {
   code: string;
   name: string;
@@ -162,6 +188,9 @@ export interface IProduct extends Document {
   brand?: string;
   metaTitle?: string;
   metaDescription?: string;
+  materialCare?: string;
+  customSections?: IProductCustomSection[];
+  specifications?: IProductSpecification[];
   purchasePrice?: number;
   price: number;
   stock: number;
@@ -188,6 +217,25 @@ const ProductSchema = new Schema<IProduct>(
     brand: String,
     metaTitle: String,
     metaDescription: String,
+    materialCare: { type: String, default: null },
+    customSections: {
+      type: [
+        {
+          heading: { type: String, required: true },
+          content: { type: String, required: true },
+        },
+      ],
+      default: [],
+    },
+    specifications: {
+      type: [
+        {
+          key: { type: String, required: true },
+          value: { type: String, required: true },
+        },
+      ],
+      default: [],
+    },
     purchasePrice: Number,
     price: { type: Number, required: true },
     stock: { type: Number, default: 0 },
@@ -342,6 +390,12 @@ export interface IProductVariant extends Document {
   /** Falls back to Product.discount when null — 0-100. Lets a promotion apply to one
    * option (e.g. the 50ml bottle) without discounting every size of the same product. */
   discountOverride: number | null;
+  /** Primary featured photo for this specific variant (e.g. Red front view) */
+  image?: string | null;
+  /** Secondary angle/detail photo for this specific variant (e.g. Red back view) */
+  secondaryImage?: string | null;
+  /** Array of both variant images [image, secondaryImage] */
+  images?: string[];
   isActive: boolean;
   /** This variant's own average rating — computed from Review documents tagged with
    * this variantId, independently of the parent Product's overall rating. 0 until the
@@ -362,6 +416,9 @@ const ProductVariantSchema = new Schema<IProductVariant>(
     priceOverride: { type: Number, default: null },
     purchasePriceOverride: { type: Number, default: null },
     discountOverride: { type: Number, default: null },
+    image: { type: String, default: null },
+    secondaryImage: { type: String, default: null },
+    images: { type: [String], default: [] },
     isActive: { type: Boolean, default: true },
     rating: { type: Number, default: 0 },
     numReviews: { type: Number, default: 0 },
@@ -700,6 +757,8 @@ export interface ICoupon extends Document {
   maxUses?: number;
   usedCount: number;
   isActive: boolean;
+  showToCustomer: boolean;
+  colorTheme?: string;
   expiresAt?: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -715,6 +774,8 @@ const CouponSchema = new Schema<ICoupon>(
     maxUses: Number,
     usedCount: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+    showToCustomer: { type: Boolean, default: false },
+    colorTheme: { type: String, default: null },
     expiresAt: Date,
   },
   { timestamps: true }

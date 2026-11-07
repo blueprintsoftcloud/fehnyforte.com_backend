@@ -24,7 +24,11 @@ import {
   updateHeroConfig,
   updateNavbarConfig,
   updateFooterConfig,
+  updatePreFooterConfig,
+  updateFeaturedCategoriesConfig,
   updateStorefrontTheme,
+  updateCategoryShape,
+  updateActiveOccasion,
   updateAnnouncementTemplate,
   updateCarouselTemplate,
   updateDiscountTemplate,
@@ -86,7 +90,11 @@ router.get("/homepage-config", authMiddleware, adminOrStaff("BANNER_VIEW"), getH
 router.put("/homepage-config/hero", authMiddleware, adminOrStaff("BANNER_EDIT"), updateHeroConfig);
 router.put("/homepage-config/navbar", authMiddleware, adminOrStaff("BANNER_EDIT"), updateNavbarConfig);
 router.put("/homepage-config/footer", authMiddleware, adminOrStaff("BANNER_EDIT"), updateFooterConfig);
+router.put("/homepage-config/pre-footer", authMiddleware, adminOrStaff("BANNER_EDIT"), updatePreFooterConfig);
+router.put("/homepage-config/featured-categories", authMiddleware, adminOrStaff("BANNER_EDIT"), updateFeaturedCategoriesConfig);
 router.put("/homepage-config/theme", authMiddleware, adminOrStaff("BANNER_EDIT"), updateStorefrontTheme);
+router.put("/homepage-config/category-shape", authMiddleware, adminOrStaff("BANNER_EDIT"), updateCategoryShape);
+router.put("/homepage-config/occasion", authMiddleware, adminOrStaff("BANNER_EDIT"), updateActiveOccasion);
 // Presentation-only template pickers for the 4 sections that don't have per-template
 // content of their own (see companySettings.controller.ts's SECTION_TEMPLATE_KEYS) —
 // same BANNER_EDIT gate as every other homepage-layout write.
